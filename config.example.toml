@@ -1,0 +1,58 @@
+# ============================================================
+# twitter2telegram 配置模板
+# 用法：cp config.example.toml config.toml，再把下面带「← 必填」的值填上
+# config.toml 含机密、已被 .gitignore 忽略；本文件只放占位符，可安全提交
+# ============================================================
+
+[twitter]
+# ← 必填：第三方推文 API 的 Key（默认实现对接 api.twitterapi.io 的接口，也可替换为兼容服务）
+api_key = "PUT-YOUR-TWEET-API-KEY"
+# 要监控的博主用户名（不带 @，可多个）
+usernames = ["elonmusk"]
+# 轮询间隔（秒）。单个活跃博主 120~300 都合适，太短会多花抓取费用
+poll_interval_sec = 120
+# 是否把博主的「回复」也翻译转发
+include_replies = false
+# 是否把「转推(RT)」也翻译转发
+include_retweets = false
+# 监控用 advanced_search 时间窗增量查询：每轮只查"上次到现在"，
+# 空闲窗口返回 0 条、最省钱。
+# 单轮每个博主最多处理几条新推（防止异常情况下刷屏；超出的最旧几条丢弃不发）
+max_per_poll = 5
+# 首次启动时，把最近 N 条历史推文补发到群里（0 = 不补发，只把现有推文设为基线，之后只发新的）
+backfill_on_start = 0
+
+[llm]
+# 本地 cliproxyapi（OpenAI 兼容接口）
+base_url = "http://127.0.0.1:8317/v1"
+# ← 必填：cliproxyapi 的 api-key（见其 config.yaml 的 api-keys）
+api_key = "PUT-YOUR-CLIPROXYAPI-KEY"
+# 翻译模型（快、稳）
+model = "claude-sonnet-4-6"
+# 解读模型：单独指定（用 opus 更详尽）；留空则与 model 相同
+explain_model = "claude-opus-4-8"
+# 单次调用超时（秒）。opus 出长解读较慢，给足
+timeout_sec = 120
+# 每条推文内翻译/解读的重试次数（无 sleep）
+max_retries = 3
+
+[telegram]
+# ← 必填：@BotFather 创建机器人后给的 token
+bot_token = "PUT-YOUR-TELEGRAM-BOT-TOKEN"
+# ← 必填：目标会话的 chat_id（群一般是负数、超级群以 -100 开头；私聊是正数）
+#   获取方法：把 bot 拉进群并随便发一条消息，然后 `python3 main.py --chat-id`
+chat_id = "-1001234567890"
+# 是否把推文图片一起转发到群（视频较复杂，统一只在页脚标注「🎬 含视频」并附原推链接）
+forward_media = true
+# 静默推送（true = 不响铃）
+disable_notification = false
+# 关闭链接预览大卡片，保持消息整洁
+disable_web_page_preview = true
+
+[display]
+# 页脚时间显示用的时区
+timezone = "Asia/Shanghai"
+
+[storage]
+# SQLite 状态库路径（相对本目录）。记录已处理推文，重启不重复发
+state_db = "state.db"

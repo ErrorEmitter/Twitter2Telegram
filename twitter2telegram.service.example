@@ -1,0 +1,19 @@
+[Unit]
+Description=twitter2telegram - 推文翻译转发到 Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ↓ 改成你的项目目录
+WorkingDirectory=/path/to/twitter2telegram
+# ↓ 改成你的 python(≥3.11) 与 main.py 的绝对路径（用 `which python3` 查）
+ExecStart=/usr/bin/python3 /path/to/twitter2telegram/main.py
+Restart=always
+RestartSec=10
+# ↓ 用户级服务需要；改成你的家目录
+Environment=HOME=/home/YOUR_USER
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
