@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import signal
 import sys
 import time
@@ -33,16 +34,24 @@ CONFIG_PATH = HERE / "config.toml"
 # ---------- 轮询主逻辑 ----------
 
 def run_cycle(cfg, store: Store) -> None:
-    """一轮：抓新推 → 发原文占位；再跑填充 pass（先翻译后解读，edit 占位）。"""
+    """一轮：抓新推→入库(内容落盘)；发送 pass(本地可重试)；填充 pass(补译/解读)。"""
     for username in cfg.twitter.usernames:
         _poll_user(cfg, store, username)
+    _post_pending(cfg, store)
     _enhance_pending(cfg, store)
 
 
 # 时间窗重叠：每轮多回看这么多秒，兜住推文 API 索引延迟造成的漏推（seen() 去重，不会重发）
 _OVERLAP_SEC = 180
-# 首次 backfill 回看窗口：往前查这么久来取最近 N 条
+# 时间窗回看封顶（runaway 兜底）：游标即便因故卡住，单轮也最多查这么久。
+# 设 7 天——故障/欠费/宕机 ≤7 天，恢复时整段补齐、不丢；只有极端 >7 天才丢更老的。
+_MAX_LOOKBACK_SEC = 7 * 86400
+# 每页最多取的页数（满页才翻页，见 source.fetch_window）；给足以应对长宕机后的大量补齐
+_MAX_PAGES = 10
+# 首次 backfill 回看窗口
 _BACKFILL_LOOKBACK_SEC = 7 * 86400
+# 发送（原文）本地重试上限：发不出去时每轮重试一次，约 144 次≈1 天后放弃（重试只调 Telegram，零 twitter 计费）
+_MAX_POST_ATTEMPTS = 144
 
 
 def _cache_path(cfg, username: str) -> Path:
@@ -61,32 +70,28 @@ def _poll_user(cfg, store: Store, username: str) -> None:
         return
 
     if first_run:
-        since, max_pages = now - _BACKFILL_LOOKBACK_SEC, 1  # 最新一页就够
+        since = now - _BACKFILL_LOOKBACK_SEC
     else:
-        since, max_pages = int(last) - _OVERLAP_SEC, 3      # 查 [上次-重叠, 现在]
+        # 查 [上次-重叠, 现在]；回看封顶 7 天（仅 runaway 兜底，足以补齐任何 ≤7 天的宕机）
+        since = max(int(last) - _OVERLAP_SEC, now - _MAX_LOOKBACK_SEC)
 
-    tweets = _fetch_or_alert(cfg, store, username, since, now, max_pages)
+    tweets = _fetch_or_alert(cfg, store, username, since, now, _MAX_PAGES)
     if tweets is None:
-        return  # 抓取失败：已按需提示一次，不重试，下轮再来
+        return  # 抓取失败：不推进游标，下轮再来（封顶保证下轮窗口也不会过大）
 
     if first_run:
         new = list(reversed(tweets))[-cfg.twitter.backfill_on_start:]  # 旧→新，取最新 keep 条
         log.info("@%s 首次：补发最近 %d 条", username, len(new))
     else:
-        new = [t for t in reversed(tweets) if not store.seen(t.id)]  # 旧→新，按时间顺序发
-        cap = cfg.twitter.max_per_poll
-        if cap > 0 and len(new) > cap:
-            log.warning("@%s 窗口内 %d 条新推超过上限 %d，丢弃最旧 %d 条", username, len(new), cap, len(new) - cap)
-            new = new[-cap:]
+        new = [t for t in reversed(tweets) if not store.seen(t.id)]  # 旧→新；全部入库、不丢弃
         if new:
-            log.info("@%s 发现 %d 条新推", username, len(new))
+            log.info("@%s 发现 %d 条新推，入库待发", username, len(new))
 
-    all_ok = True
     for t in new:
-        if not _post_placeholders_one(cfg, store, t):
-            all_ok = False  # 发送失败：先不推进游标，下轮重试（已成功的靠 seen() 去重）
-    if all_ok:
-        store.set_last_checked(username, now)
+        _strip_media_links(t, cfg.telegram.forward_media)
+        store.add_new(t, cfg.telegram.chat_id)   # 抓到先落盘+去重；发送交给发送 pass（可本地重试、按轮限速）
+    # 关键：抓取成功就推进游标——内容已落盘，发送失败也不会丢、也不会重复拉取计费。
+    store.set_last_checked(username, now)
 
 
 def _fetch_or_alert(cfg, store: Store, username: str, since_ts: int, until_ts: int, max_pages: int):
@@ -125,23 +130,37 @@ def _strip_media_links(tweet, forward_media: bool) -> None:
         tweet.text = text.rstrip()
 
 
-def _post_placeholders_one(cfg, store: Store, tweet) -> bool:
-    """发原文 + 占位（+媒体置底），入库。成功返回 True；发送失败返回 False（下轮重试）。"""
-    _strip_media_links(tweet, cfg.telegram.forward_media)
-    try:
-        two_part, msg1_id, msg2_id, media_status = publisher.post_placeholders(cfg.telegram, cfg.tz, tweet)
-    except ApiError as exc:
-        log.error("发送原文失败 tweet=%s（下轮重试）：%s", tweet.id, exc)
-        return False
-    store.add_posted(tweet, cfg.telegram.chat_id, msg1_id, msg2_id, two_part, media_status)
-    log.info("已发原文 @%s tweet=%s 布局=%s 图%d 视频%d 媒体=%s", tweet.username, tweet.id,
-             "2条" if two_part else "1条", len(tweet.photos), len(tweet.videos), media_status)
-    return True
+def _post_pending(cfg, store: Store) -> None:
+    """发送 pass：把已入库但未发出的推文发到群（按时间从旧到新）。失败本地重试（只调 Telegram，
+    零 twitter 计费），用尽 _MAX_POST_ATTEMPTS 才放弃——保证 telegram 故障期间旧推不丢、恢复后照常补发。
+    每轮最多发 max_per_poll 条（防刷屏），积压会分多轮发完，不丢。"""
+    cap = cfg.twitter.max_per_poll
+    rows = store.pending_posts(_MAX_POST_ATTEMPTS)
+    for row in (rows[:cap] if cap > 0 else rows):
+        tweet = tweet_from_row(row)   # 文本已是剥离后的；photos/videos/media_links 都在
+        try:
+            two_part, msg1_id, msg2_id, media_status = publisher.post_placeholders(cfg.telegram, cfg.tz, tweet)
+        except ApiError as exc:
+            n = store.bump_post(tweet.id)
+            msg = str(exc)
+            if "migrate_to_chat_id" in msg or "upgraded to a supergroup" in msg:
+                m = re.search(r"migrate_to_chat_id\D+(-?\d+)", msg)
+                log.error("群已升级为超级群，chat_id 失效！请把 config.toml 的 chat_id 改为 %s 后重启服务。",
+                          m.group(1) if m else "（见 --chat-id）")
+            else:
+                log.warning("发送失败 tweet=%s (%d/%d，下轮本地重试)：%s", tweet.id, n, _MAX_POST_ATTEMPTS, exc)
+            if n >= _MAX_POST_ATTEMPTS:
+                store.fail_post(tweet.id)
+                log.error("tweet=%s 发送重试用尽，放弃。", tweet.id)
+            continue
+        store.mark_posted(tweet.id, msg1_id, msg2_id, two_part, media_status)
+        log.info("已发原文 @%s tweet=%s 布局=%s 图%d 视频%d 媒体=%s", tweet.username, tweet.id,
+                 "2条" if two_part else "1条", len(tweet.photos), len(tweet.videos), media_status)
 
 
 def _enhance_pending(cfg, store: Store) -> None:
-    """填充 pass：按「先翻译、后解读」给每条待填推文替换占位（edit 成功才标 done，避免占位卡住）。"""
-    for row in store.pending():
+    """填充 pass：对【已发出】的推文按「先翻译、后解读」替换占位（edit 成功才标 done，避免占位卡住）。"""
+    for row in store.pending_fills():
         tid = row["tweet_id"]
         tweet = tweet_from_row(row)
         two_part = bool(row["two_part"])
@@ -177,8 +196,8 @@ def _enhance_pending(cfg, store: Store) -> None:
             translation, t_status = zh, "done"
             log.info("已填译文 tweet=%s", tid)
 
-        # 2) 解读（翻译已成才做）
-        if t_status == "done" and row["expl_status"] == "pending":
+        # 2) 解读（翻译已成、或原文是中文跳过翻译[skipped] 时做）
+        if t_status in ("done", "skipped") and row["expl_status"] == "pending":
             ex = _try_llm(cfg, translator.explain, tweet.text, "解读", tid)
             if ex is None:
                 if store.bump_expl(tid) >= cfg.llm.max_retries:
@@ -187,14 +206,14 @@ def _enhance_pending(cfg, store: Store) -> None:
                     try:
                         publisher.fill_explanation(cfg.telegram, cfg.tz, two_part=two_part, msg1_id=row["msg1_id"],
                                                    msg2_id=row["msg2_id"], tweet=tweet, translation=translation,
-                                                   t_status="done", explanation=None, e_status="failed")
+                                                   t_status=t_status, explanation=None, e_status="failed")
                     except ApiError:
                         pass
                 continue
             try:
                 publisher.fill_explanation(cfg.telegram, cfg.tz, two_part=two_part, msg1_id=row["msg1_id"],
                                            msg2_id=row["msg2_id"], tweet=tweet, translation=translation,
-                                           t_status="done", explanation=ex, e_status="done")
+                                           t_status=t_status, explanation=ex, e_status="done")
             except ApiError as exc:
                 log.warning("填解读失败 tweet=%s（下轮重试）：%s", tid, exc)
                 continue
@@ -324,15 +343,20 @@ def cmd_test(cfg) -> int:
 
 
 def _demo_send(tg, tz, llm, tweet):
-    """同步演示一条（占位 → 填译文 → 填解读），供 --test / --send-latest 用。返回 (译文, 解读)。"""
+    """同步演示一条（占位 →(填译文)→ 填解读），供 --test / --send-latest 用。返回 (译文, 解读)。
+
+    原文明显是中文则跳过翻译：不译、也不显示译文段（与正式轮询一致）。
+    """
     _strip_media_links(tweet, tg.forward_media)
     two_part, msg1, msg2, _ = publisher.post_placeholders(tg, tz, tweet)
-    zh = translator.translate(llm, tweet.text)
-    publisher.fill_translation(tg, tz, two_part=two_part, msg1_id=msg1, tweet=tweet,
-                               translation=zh, t_status="done", explanation=None, e_status="pending")
+    zh, t_status = None, "skipped"
+    if not tweet.skip_translation:
+        zh, t_status = translator.translate(llm, tweet.text), "done"
+        publisher.fill_translation(tg, tz, two_part=two_part, msg1_id=msg1, tweet=tweet,
+                                   translation=zh, t_status="done", explanation=None, e_status="pending")
     ex = translator.explain(llm, tweet.text)
     publisher.fill_explanation(tg, tz, two_part=two_part, msg1_id=msg1, msg2_id=msg2, tweet=tweet,
-                               translation=zh, t_status="done", explanation=ex, e_status="done")
+                               translation=zh, t_status=t_status, explanation=ex, e_status="done")
     return zh, ex
 
 

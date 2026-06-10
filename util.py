@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
 
 USER_AGENT = "twitter2telegram/1.0 (+local)"
+
+# Telegram 接口路径形如 /bot<token>/method，报错信息会带 URL——把 token 段打码，避免机密进日志
+_BOT_TOKEN_RE = re.compile(r"/bot[^/]+")
 
 
 class ApiError(RuntimeError):
@@ -54,8 +58,10 @@ def http_json(
 
 
 def _host(url: str) -> str:
+    """报错用的 URL 摘要（scheme://host/path，去掉查询串）；bot token 段打码。"""
     try:
         p = urllib.parse.urlparse(url)
-        return f"{p.scheme}://{p.netloc}{p.path}"
+        url = f"{p.scheme}://{p.netloc}{p.path}"
     except Exception:
-        return url
+        pass
+    return _BOT_TOKEN_RE.sub("/bot***", url)

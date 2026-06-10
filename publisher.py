@@ -106,10 +106,11 @@ def list_chats(cfg: TelegramCfg) -> list[dict]:
 # ---------- 渲染 ----------
 
 def _render_single(tz, tweet, translation, t_status, explanation, e_status) -> str:
-    """1 条布局：作者 → 译文 → 原文 → 解读（各为可展开折叠块）→ 页脚。"""
-    parts = [_header(tweet),
-             _trans_section(translation, t_status, _TRANS_1),
-             _orig_section(tweet, _ORIG_1)]
+    """1 条布局：作者 →(译文)→ 原文 → 解读（各为可展开折叠块）→ 页脚。原文是中文则省略译文段。"""
+    parts = [_header(tweet)]
+    if not tweet.skip_translation:
+        parts.append(_trans_section(translation, t_status, _TRANS_1))
+    parts.append(_orig_section(tweet, _ORIG_1))
     es = _expl_section(explanation, e_status, _EXPL_1)
     if es:
         parts.append(es)
@@ -118,13 +119,13 @@ def _render_single(tz, tweet, translation, t_status, explanation, e_status) -> s
 
 
 def _render_msg1_2p(tz, tweet, translation, t_status) -> str:
-    """2 条布局第一条：作者 → 译文 → 原文 → 页脚。"""
-    return "\n\n".join([
-        _header(tweet),
-        _trans_section(translation, t_status, _TRANS_2),
-        _orig_section(tweet, _ORIG_2),
-        _footer(tz, tweet),
-    ])
+    """2 条布局第一条：作者 →(译文)→ 原文 → 页脚。原文是中文则省略译文段。"""
+    parts = [_header(tweet)]
+    if not tweet.skip_translation:
+        parts.append(_trans_section(translation, t_status, _TRANS_2))
+    parts.append(_orig_section(tweet, _ORIG_2))
+    parts.append(_footer(tz, tweet))
+    return "\n\n".join(parts)
 
 
 def _render_msg2_2p(explanation, e_status) -> str | None:

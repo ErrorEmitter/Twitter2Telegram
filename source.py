@@ -44,8 +44,34 @@ class Tweet:
     has_video: bool = False
     media_links: list[str] = field(default_factory=list)  # 文中的媒体 t.co 短链（发送成功才剥离）
     media_status: str = "none"   # none/ok/failed：渲染页脚时用（failed 则补回媒体链接）
+    skip_translation: bool = False  # 原文明显是中文 → 不翻译、也不显示译文段
     is_reply: bool = False
     is_retweet: bool = False
+
+
+def is_chinese(text: str) -> bool:
+    """原博文是否"明显是中文"（CJK 汉字占多数）。是则跳过翻译、也不显示译文占位。
+
+    日文也大量用汉字、韩文偶有汉字夹杂——只要出现假名/谚文就判定不是中文，照常翻译
+    （误伤面只有颜文字里的「ツ/ノ」等个别假名，代价不过是多走一次翻译，模型会原样返回中文）。
+    """
+    if any(_is_kana_or_hangul(ch) for ch in text):
+        return False
+    cjk = sum(1 for ch in text if "一" <= ch <= "鿿")  # CJK 统一表意文字
+    latin = sum(1 for ch in text if ch.isascii() and ch.isalpha())
+    return cjk >= 4 and cjk > latin
+
+
+def _is_kana_or_hangul(ch: str) -> bool:
+    cp = ord(ch)
+    return (
+        0x3040 <= cp <= 0x30FF      # 日文平假名/片假名
+        or 0x31F0 <= cp <= 0x31FF   # 片假名音标扩展
+        or 0xFF66 <= cp <= 0xFF9F   # 半角片假名
+        or 0x1100 <= cp <= 0x11FF   # 韩文字母(Jamo)
+        or 0x3130 <= cp <= 0x318F   # 韩文兼容字母
+        or 0xAC00 <= cp <= 0xD7A3   # 韩文音节
+    )
 
 
 def fetch_user_status(cfg: TwitterCfg, username: str) -> int | None:
@@ -71,13 +97,21 @@ def fetch_user_status(cfg: TwitterCfg, username: str) -> int | None:
         return None
 
 
+# 当前页 ≥ 此条数才信任 has_next_page 继续翻页；< 此数则认定是最后一页（忽略谎报）。
+# 偏保守(10 而非满 20)：留足余量，宁可偶尔多翻一页也不漏爆发。
+_PAGINATE_MIN = 10
+
+
 def fetch_window(cfg: TwitterCfg, username: str, since_ts: int, until_ts: int,
-                 max_pages: int = 3) -> list[Tweet]:
+                 max_pages: int = 10) -> list[Tweet]:
     """用 advanced_search 查 [since_ts, until_ts) 时间窗内该博主的推文（最新在前）。
 
     这是监控主用接口：时间窗增量查询，空闲窗口返回 0 条、最省。
     回复/转推按配置在查询端就过滤掉（`-filter:replies` / `include:nativeretweets`），不为它们付费。
-    失败抛 ApiError。
+
+    翻页判据：实测该 API 的 `has_next_page` 会"谎报"（返回几条也说 true，害你白翻一个空页、多花 15 credits）。
+    所以：当前页 **< _PAGINATE_MIN(10) 条 → 忽略 has_next_page，认定最后一页**（省掉空页）；
+    **≥ 10 条 → 信任 has_next_page，它说还有就继续翻**（爆发也不漏）。失败抛 ApiError。
     """
     query = f"from:{username} since_time:{int(since_ts)} until_time:{int(until_ts)}"
     if not cfg.include_replies:
@@ -94,10 +128,11 @@ def fetch_window(cfg: TwitterCfg, username: str, since_ts: int, until_ts: int,
         _throttle()
         data = http_json(_ADV_SEARCH_URL, headers={"X-API-Key": cfg.api_key}, params=params, timeout=30)
         _raise_if_error(data)
-        out.extend(_parse_and_filter(_locate_tweets(data), cfg, username))
-        if not data.get("has_next_page") or not data.get("next_cursor"):
+        raw = _locate_tweets(data)
+        out.extend(_parse_and_filter(raw, cfg, username))
+        cursor = data.get("next_cursor")
+        if len(raw) < _PAGINATE_MIN or not data.get("has_next_page") or not cursor:
             break
-        cursor = data["next_cursor"]
     return out
 
 
@@ -198,6 +233,7 @@ def _parse_tweet(item: dict, fallback_user: str) -> Tweet | None:
         videos=videos,
         has_video=has_video,
         media_links=media_links,
+        skip_translation=is_chinese(text),
         is_reply=is_reply,
         is_retweet=is_retweet,
     )

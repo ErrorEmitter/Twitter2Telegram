@@ -23,12 +23,16 @@ CREATE TABLE IF NOT EXISTS tweets (
     url           TEXT,
     has_video     INTEGER NOT NULL DEFAULT 0,
     original_text TEXT,
+    photos        TEXT,                          -- JSON：图片直链（发送/重试用）
+    videos        TEXT,                          -- JSON：视频 mp4 直链
+    media_links   TEXT,                          -- JSON：文中媒体 t.co 短链（失败时显示）
     tg_chat_id    TEXT,
+    post_status   TEXT NOT NULL DEFAULT 'pending',  -- pending/done/failed：原文是否已发出（含本地重试）
+    post_attempts INTEGER NOT NULL DEFAULT 0,
     msg1_id       INTEGER,
     msg2_id       INTEGER,                 -- 2 条布局时的第二条；1 条布局为 NULL
     two_part      INTEGER NOT NULL DEFAULT 0,
     media_status  TEXT NOT NULL DEFAULT 'none',  -- none / ok / failed（失败则页脚补媒体链接）
-    media_links   TEXT,                          -- JSON：文中媒体 t.co 短链（失败时显示）
     translation   TEXT,
     trans_status  TEXT NOT NULL DEFAULT 'pending',   -- pending/done/failed
     trans_attempts INTEGER NOT NULL DEFAULT 0,
@@ -61,27 +65,57 @@ class Store:
     def seen(self, tweet_id: str) -> bool:
         return self.db.execute("SELECT 1 FROM tweets WHERE tweet_id=?", (tweet_id,)).fetchone() is not None
 
-    def add_posted(self, tweet: Tweet, chat_id: str, msg1_id: int, msg2_id: int | None,
-                   two_part: bool, media_status: str) -> None:
+    def add_new(self, tweet: Tweet, chat_id: str) -> None:
+        """抓到推文即存库（内容落盘、去重标记）；post_status=pending，等发送 pass 来发。
+
+        原文明显是中文时 trans_status='skipped'：不翻译、渲染时也不显示译文段。
+        """
+        trans_status = "skipped" if tweet.skip_translation else "pending"
         self.db.execute(
-            "INSERT OR REPLACE INTO tweets(tweet_id, username, author_name, created_at, url, has_video, "
-            "original_text, tg_chat_id, msg1_id, msg2_id, two_part, media_status, media_links, "
-            "translation, trans_status, trans_attempts, explanation, expl_status, expl_attempts, inserted_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending', 0, NULL, 'pending', 0, ?)",
+            "INSERT OR IGNORE INTO tweets(tweet_id, username, author_name, created_at, url, has_video, "
+            "original_text, photos, videos, media_links, tg_chat_id, post_status, trans_status, inserted_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
             (
                 tweet.id, tweet.username, tweet.author_name,
                 tweet.created_at.isoformat() if tweet.created_at else None,
                 tweet.url, int(tweet.has_video), tweet.text,
-                str(chat_id), msg1_id, msg2_id, int(two_part), media_status, json.dumps(tweet.media_links),
-                time.time(),
+                json.dumps(tweet.photos), json.dumps(tweet.videos), json.dumps(tweet.media_links),
+                str(chat_id), trans_status, time.time(),
             ),
         )
         self.db.commit()
 
-    def pending(self) -> list[sqlite3.Row]:
-        """还有槽没填好的推文（翻译或解读 = pending）。"""
+    # --- 发送（原文+占位）：可本地重试，不再调 twitter ---
+
+    def pending_posts(self, max_attempts: int) -> list[sqlite3.Row]:
         return self.db.execute(
-            "SELECT * FROM tweets WHERE trans_status='pending' OR expl_status='pending' ORDER BY inserted_at"
+            "SELECT * FROM tweets WHERE post_status='pending' AND post_attempts < ? ORDER BY inserted_at",
+            (max_attempts,),
+        ).fetchall()
+
+    def mark_posted(self, tweet_id: str, msg1_id: int, msg2_id: int | None,
+                    two_part: bool, media_status: str) -> None:
+        self.db.execute(
+            "UPDATE tweets SET post_status='done', msg1_id=?, msg2_id=?, two_part=?, media_status=? "
+            "WHERE tweet_id=?",
+            (msg1_id, msg2_id, int(two_part), media_status, tweet_id),
+        )
+        self.db.commit()
+
+    def bump_post(self, tweet_id: str) -> int:
+        self.db.execute("UPDATE tweets SET post_attempts=post_attempts+1 WHERE tweet_id=?", (tweet_id,))
+        self.db.commit()
+        return self.db.execute("SELECT post_attempts FROM tweets WHERE tweet_id=?", (tweet_id,)).fetchone()[0]
+
+    def fail_post(self, tweet_id: str) -> None:
+        self.db.execute("UPDATE tweets SET post_status='failed' WHERE tweet_id=?", (tweet_id,))
+        self.db.commit()
+
+    def pending_fills(self) -> list[sqlite3.Row]:
+        """已发出、但翻译或解读还没填好的推文。"""
+        return self.db.execute(
+            "SELECT * FROM tweets WHERE post_status='done' "
+            "AND (trans_status='pending' OR expl_status='pending') ORDER BY inserted_at"
         ).fetchall()
 
     # --- 翻译槽 ---
@@ -143,17 +177,20 @@ class Store:
 
 
 def tweet_from_row(row: sqlite3.Row) -> Tweet:
-    """从状态库行还原 Tweet（编辑重渲染用；图片已发出，photos 置空）。"""
+    """从状态库行还原 Tweet（发送/重试要用 photos/videos；编辑重渲染要用文本/媒体状态）。"""
     created = None
     if row["created_at"]:
         try:
             created = datetime.fromisoformat(row["created_at"])
         except ValueError:
             created = None
-    try:
-        media_links = json.loads(row["media_links"]) if row["media_links"] else []
-    except (ValueError, TypeError):
-        media_links = []
+
+    def _jload(key):
+        try:
+            return json.loads(row[key]) if row[key] else []
+        except (ValueError, TypeError):
+            return []
+
     return Tweet(
         id=row["tweet_id"],
         username=row["username"] or "",
@@ -161,8 +198,10 @@ def tweet_from_row(row: sqlite3.Row) -> Tweet:
         text=row["original_text"] or "",
         url=row["url"] or "",
         created_at=created,
-        photos=[],
+        photos=_jload("photos"),
+        videos=_jload("videos"),
         has_video=bool(row["has_video"]),
-        media_links=media_links,
+        media_links=_jload("media_links"),
         media_status=row["media_status"] or "none",
+        skip_translation=(row["trans_status"] == "skipped"),
     )

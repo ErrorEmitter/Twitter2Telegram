@@ -17,7 +17,7 @@ include_replies = false
 include_retweets = false
 # 监控用 advanced_search 时间窗增量查询：每轮只查"上次到现在"，
 # 空闲窗口返回 0 条、最省钱。
-# 单轮每个博主最多处理几条新推（防止异常情况下刷屏；超出的最旧几条丢弃不发）
+# 每轮最多【发送】几条（防积压刷屏）。新推一律先全部入库不丢；超过这个数的分多轮发完，不丢内容
 max_per_poll = 5
 # 首次启动时，把最近 N 条历史推文补发到群里（0 = 不补发，只把现有推文设为基线，之后只发新的）
 backfill_on_start = 0
@@ -42,7 +42,11 @@ bot_token = "PUT-YOUR-TELEGRAM-BOT-TOKEN"
 # ← 必填：目标会话的 chat_id（群一般是负数、超级群以 -100 开头；私聊是正数）
 #   获取方法：把 bot 拉进群并随便发一条消息，然后 `python3 main.py --chat-id`
 chat_id = "-1001234567890"
-# 是否把推文图片一起转发到群（视频较复杂，统一只在页脚标注「🎬 含视频」并附原推链接）
+# 选填：调试会话 id。--test / --send-latest 等手动测试消息发这里（不打扰群）；留空则发上面的 chat_id。
+#   填个人用户 id 时，该用户需先对 bot 发过 /start 才能收到
+debug_chat_id = ""
+# 是否把推文媒体（图片+视频）转发到群（作为该推最后一条消息发出；
+# 视频走 URL 直发约有 20MB 上限，发送失败则在页脚补回媒体链接）
 forward_media = true
 # 静默推送（true = 不响铃）
 disable_notification = false

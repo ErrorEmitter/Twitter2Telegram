@@ -103,7 +103,7 @@ journalctl --user -u twitter2telegram -f
 | `twitter.poll_interval_sec` | 600 | 轮询间隔（当前 10 分钟）。越短越实时，但请求更频繁 |
 | `twitter.include_replies` | false | 是否也翻译博主的回复 |
 | `twitter.include_retweets` | false | 是否也翻译转推(RT) |
-| `twitter.max_per_poll` | 5 | 单轮每博主最多发几条（防异常刷屏；超出的最旧几条只记录不发） |
+| `twitter.max_per_poll` | 5 | 每轮发送 pass 最多发几条（防积压刷屏）；超出的留在队列、下轮接着发，不丢 |
 | `twitter.backfill_on_start` | 1 | 首次启动补发最近 N 条历史推文；**当前=1（首次只发最新 1 条做测试）**，满意后可改 0 |
 | `llm.model` | claude-sonnet-4-6 | **翻译**模型（快、稳） |
 | `llm.explain_model` | claude-opus-4-8 | **解读**模型（更详尽深入）；留空则与 `model` 相同 |
@@ -143,13 +143,14 @@ journalctl --user -u twitter2telegram -f
 ### 数据流（每 10 分钟一轮）
 
 ```
-for 每个博主:
-    advanced_search 查 [上次检查-180s, 现在] 时间窗      # 只拿新推；空闲窗口返回 0 条
-       └─ 抓取失败 → 群里提示一次(不重试)、不推进游标(下轮窗口变大补回)
-    对每条新推(seen() 去重后，按旧→新):
-       发原文占位: sendMessage 发 1~2 条(译文位「翻译中…」/解读位「📖解读中…」)；有图→置底；入库
-       (发送失败→不入库、不推进游标，下轮重试)
-填充 pass(遍历未填好的推文，先翻译后解读):
+抓取 pass: for 每个博主:
+    advanced_search 查 [上次检查-180s, 现在] 时间窗（回看封顶 7 天=兜底；页内 ≥10 条才翻页，空闲每轮 1 请求）
+       ├─ 抓取失败 → 群里提示一次(不重试)、不推进游标
+       └─ 抓取成功 → 每条新推 add_new 落盘(内容+去重) → **推进游标**(已落盘，不会再重复拉取计费)
+发送 pass(_post_pending，遍历"已入库未发出"的):
+       发原文占位 sendMessage 1~2 条(译文位「翻译中…」/解读位「📖解读中…」)+ 媒体置底 → 标 posted
+       (发送失败→留在待发队列，下轮用库里内容【本地重试，不再调 twitter】，~1天后才放弃 → 不丢)
+填充 pass(_enhance_pending，对已发出的，先翻译后解读):
        ① translate → editMessageText 替换译文占位
        ② explain   → edit 替换解读占位(无术语→删掉解读那条)
        (edit 成功才标 done；各槽失败 bump，到 max_retries 降级：翻译标注/解读去掉)
@@ -171,7 +172,10 @@ for 每个博主:
 ### 运行机制（便于排错）
 
 - **监控方式（时间窗增量）**：用 `advanced_search` 查 `from:博主 since_time:上次 until_time:现在`。每轮只查"上次到现在"的窗口，空闲时返回 0 条最省。回复/转推用 `-filter:replies` 在查询端就排除，不为其付费。窗口左端多回看 180s（`_OVERLAP_SEC`）兜住索引延迟，配合 `seen()` 去重不会重发。
-- **去重 / 状态**：`state.db`（SQLite）。`tweets` 表每条推文存消息 id、布局(1/2 条)、译文/解读两槽状态（`pending→done/failed` + 重试计数）；`users` 表存 `last_checked`（时间窗游标）与 `alerted`（是否已提示故障）。发送/抓取失败都不推进游标，下轮窗口变大补回、靠去重避免重发（至少一次送达）。
+- **持久化优先 / 不丢 / 不重复计费**：抓到推文先 `add_new` 落盘（内容+图片/视频+去重）并**推进游标**——因此发送再失败也不会重复拉取计费。发送是独立的 `_post_pending`，失败就用库里内容**本地重试（只调 Telegram，零推文 API 计费）**，约 1 天后才放弃 → telegram 故障/群迁移期间旧推不丢、恢复后照常补发。`post_status: pending→done/failed`，发出后才进翻译/解读填充。
+- **不丢内容**：抓到的新推**一律全部入库**（不再"超额丢弃"）；`max_per_poll` 改为"每轮最多**发送**几条"（防刷屏），积压分多轮发完、不丢。时间窗回看封顶 **7 天**（`_MAX_LOOKBACK_SEC`）——故障/欠费/宕机 ≤7 天，恢复时整段补齐、不丢；翻页用**"当前页 ≥10 条（`_PAGINATE_MIN`）才翻下一页"**（不满 10 条视为最后一页，不信会谎报的 `has_next_page`），爆发也不漏。
+- **成本护栏**：游标"抓取成功即推进"（不耦合发送）保证窗口不会无限膨胀重复计费；"页内条数足够（≥10）才翻页"避免 API 谎报 `has_next_page` 害你白翻空页（每条请求最低 ~15 credits）。这两点根治了上次欠费。故障期间请求失败本身不计费，只在恢复时补拉一次。
+- **去重 / 状态**：`state.db`（SQLite）。`tweets` 表存内容、消息 id、布局、发送状态 `post_status`、译文/解读两槽状态（`pending→done/failed`+重试计数）；`users` 表存 `last_checked`（时间窗游标）与 `alerted`（是否已提示故障）。
 - **首次基线**：第一次跑某博主时只记录 `last_checked=现在`、不刷历史；只有**之后产生的新推**才转发。想首发补几条历史就调 `backfill_on_start`。
 - **限速**：所用推文 API 免费档限 1 请求/5 秒，代码内置全局节流（`source._MIN_REQUEST_GAP`，付费档可调小）。
 - **媒体（图片+视频，置底）**：有媒体则作为**最后一条消息**发出（单项 `sendPhoto`/`sendVideo`、多项 `sendMediaGroup`，URL 交 Telegram 抓取）。**直接转发时先剥掉正文里指向媒体的 `t.co` 短链**（从 `extendedEntities.media[].url` 收集）；若媒体**发送失败**（如视频超 Telegram URL 直发的 ~20MB 上限），则页脚把链接**补回来并注明「📎 媒体」**（`media_status` 存库、随渲染）。
@@ -210,7 +214,8 @@ for 每个博主:
 | `--check` Telegram 失败 | `bot_token` 错了，或网络不通 |
 | `--test` 发送失败 | bot 没在群里 / `chat_id` 不对（群常为负数、超级群以 -100 开头） |
 | 只发了原文、没有译文/解读 | 看日志「翻译/解读失败」原因；确认 cliproxyapi 在 8317 正常（`python3 main.py --check`） |
-| 抓不到推文 | `twitter.api_key` 或 `usernames` 写错；推文 API 余额不足 |
+| 抓不到推文 / 报 402 余额不足 | 推文 API 余额耗尽，去充值；或 `api_key`/`usernames` 写错。**充值后**直接重启即可：恢复时会把宕机期间(≤7 天)的积压一次性补齐、不丢 |
+| 发送全失败、日志「upgraded to a supergroup」 | 群被升级成超级群、`chat_id` 变了。日志会打出新 id（`-100…`），填进 `config.toml` 的 `chat_id` 重启即可。已落盘的旧推会自动补发、不丢 |
 | 报 429 / QPS 超限 | 推文 API 免费档限 1 请求/5 秒，已内置节流；若仍频繁，调大 `source._MIN_REQUEST_GAP` 或减少博主数 |
 | 启动后没动静 | 正常——首次只建基线，要等博主发**新**推才会转发；想验证可临时把 `backfill_on_start` 设为 1 |
 | systemd 起不来 | `journalctl --user -u twitter2telegram -e` 看报错；确认 ExecStart 的 python 路径存在 |
