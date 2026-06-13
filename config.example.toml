@@ -31,8 +31,14 @@ api_key = "PUT-YOUR-CLIPROXYAPI-KEY"
 model = "claude-sonnet-4-6"
 # 解读模型：单独指定（用 opus 更详尽）；留空则与 model 相同
 explain_model = "claude-opus-4-8"
-# 单次调用超时（秒）。opus 出长解读较慢，给足
-timeout_sec = 120
+# 解读时开启联网检索：用 Anthropic 原生 web_search 工具，让模型对股票/代币代码、价格、市值、
+# 上市/上线、IPO、近期事件等先联网核实再解读，避免凭过时训练知识瞎猜（需代理支持 /v1/messages 的 web_search）。
+# 关掉(false)则解读退回纯模型知识。翻译不联网、不受此影响。
+explain_web_search = true
+# 单次解读最多联网搜索次数（按量计费但很便宜；调大查得更全、略慢）
+web_search_max_uses = 5
+# 单次调用超时（秒）。opus 出长解读较慢，解读还要联网检索，给足
+timeout_sec = 180
 # 每条推文内翻译/解读的重试次数（无 sleep）
 max_retries = 3
 

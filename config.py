@@ -34,6 +34,8 @@ class LLMCfg:
     explain_model: str = ""   # 解读专用模型；空则回退到 model
     timeout_sec: int = 60
     max_retries: int = 3
+    web_search: bool = True            # 解读时开启联网检索（Anthropic 原生 web_search 工具）
+    web_search_max_uses: int = 5       # 单次解读最多联网搜索次数
 
 
 @dataclass
@@ -88,6 +90,8 @@ def load_config(path: Path, strict: bool = True) -> Config:
             explain_model=str(llm.get("explain_model", "")) or str(llm.get("model", "")),
             timeout_sec=int(llm.get("timeout_sec", 60)),
             max_retries=int(llm.get("max_retries", 3)),
+            web_search=bool(llm.get("explain_web_search", True)),
+            web_search_max_uses=int(llm.get("web_search_max_uses", 5)),
         ),
         telegram=TelegramCfg(
             bot_token=str(tg.get("bot_token", "")),
